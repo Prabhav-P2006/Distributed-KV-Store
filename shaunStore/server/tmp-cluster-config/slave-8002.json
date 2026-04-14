@@ -1,0 +1,14 @@
+{
+  "role": "slave",
+  "self": { "host": "127.0.0.1", "port": 8002 },
+  "master": { "host": "127.0.0.1", "port": 8000 },
+  "heartbeat_interval_ms": 500,
+  "election_timeout_ms": 12000,
+  "aging_threshold_ms": 3000,
+  "strong_write_timeout_ms": 4000,
+  "max_staleness_offset": 5,
+  "backlog_limit": 50000,
+  "dispatch_weights": { "critical": 70, "standard": 20, "low": 10 },
+  "enable_logging": true,
+  "peer_nodes": [ { "host": "127.0.0.1", "port": 8001 }, { "host": "127.0.0.1", "port": 8003 }, { "host": "127.0.0.1", "port": 8004 }, { "host": "127.0.0.1", "port": 8005 }, { "host": "127.0.0.1", "port": 8006 }, { "host": "127.0.0.1", "port": 8007 }, { "host": "127.0.0.1", "port": 8008 }, { "host": "127.0.0.1", "port": 8009 }, { "host": "127.0.0.1", "port": 8010 } ]
+}
