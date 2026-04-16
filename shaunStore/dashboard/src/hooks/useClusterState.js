@@ -1,315 +1,362 @@
-import { useState, useEffect, useMemo, useRef } from 'react';
-import { 
-  createSlaveNodes, 
-  backgroundClients, 
-  createLogEntry,
-  priorityPalette 
+import { useState, useEffect, useRef, useCallback } from 'react';
+import {
+  CLIENT_NODES, SLAVE_NODES, MASTER_POS,
+  PRIORITY_COLORS, DISPATCH_SCHEDULE, T, mkLog,
 } from '../utils/constants';
 
+// ── Helpers ───────────────────────────────────────────────────────────────────
+let _pid = 0;
+const uid = () => `p${++_pid}-${Date.now()}`;
+
+function initSim() {
+  return {
+    // Master is a separate node (not one of the 10 slaves)
+    master: { status: 'online', offset: 0, term: 1, electingFrom: null },
+    // 10 slave nodes — always 10
+    slaves: SLAVE_NODES.map(n => ({ ...n, offset: 0, status: 'online', stale: false, votes: 0 })),
+    // Priority queues (in-memory, wiped on master crash)
+    queue:  { Critical: [], Standard: [], Low: [] },
+    // In-flight packets (all stages)
+    packets: [],
+    // Stats
+    writeCount: 0,
+    readCount:  0,
+    // Logs
+    logs: [
+      mkLog('Cluster online. Master + 10 slaves registered. 5 clients ready.', 'success'),
+      mkLog('PriorityReplicationEngine: 70/20/10 dispatch schedule active.', 'info'),
+    ],
+    // Dispatcher state
+    schedIdx:    0,
+    lastDispatch: 0,
+    strongMap:   {},  // { writeId: { acks, required } }
+  };
+}
+
+// ── Hook ──────────────────────────────────────────────────────────────────────
 export function useClusterState() {
-  const [masterId, setMasterId] = useState("master-1");
-  const [masterStatus, setMasterStatus] = useState("online");
-  const [slaves, setSlaves] = useState(createSlaveNodes);
-  const [packets, setPackets] = useState([]);
-  const [logs, setLogs] = useState(() => [
-    createLogEntry("Dashboard initialized. Master online with 10 followers.", "success"),
-    createLogEntry("Priority dispatcher active. Clients loaded.", "info"),
-  ]);
-  const [masterOffset, setMasterOffset] = useState(0);
-  const [writeCount, setWriteCount] = useState(0);
-  const [waitingStrong, setWaitingStrong] = useState([]);
-  const [votePulse, setVotePulse] = useState(false);
-  const logRef = useRef(null);
+  const S       = useRef(initSim());          // single mutable sim object
+  const logRef  = useRef(null);               // DOM ref for log scroll
+  const [snap, setSnap] = useState(S.current); // snapshot for rendering
 
-  const masterNode = useMemo(() => ({
-    id: masterId,
-    label: masterId === "master-1" ? "MASTER" : `M: ${masterId.toUpperCase()}`,
-    x: 50,
-    y: 35,
-    role: "master",
-    status: masterStatus,
-  }), [masterId, masterStatus]);
+  // Push a log entry
+  function log(msg, tone = 'info') {
+    const s = S.current;
+    s.logs = [...s.logs.slice(-300), mkLog(msg, tone)];
+  }
 
-  const nodes = useMemo(() => {
-    const nextSlaves = slaves.map((slave) =>
-      slave.id === masterId
-        ? { ...slave, role: "master", x: 50, y: 35, status: masterStatus }
-        : slave.id === "master-1" && masterId !== "master-1"
-          ? { ...slave, role: "slave", x: 50, y: 85, status: "offline", stale: false }
-          : slave
-    );
-
-    const visibleSlaves = nextSlaves
-      .filter((node) => node.id !== masterId)
-      .map((node, index) => ({
-        ...node,
-        x: 10 + (index % 5) * 20,
-        y: 70 + Math.floor(index / 5) * 15,
-      }));
-
-    return { master: masterNode, slaves: visibleSlaves, clients: backgroundClients };
-  }, [slaves, masterId, masterNode, masterStatus]);
-
-  const queueState = useMemo(() => ({
-    Critical: packets.filter((packet) => packet.stage === "queued" && packet.queue === "Critical"),
-    Standard: packets.filter((packet) => packet.stage === "queued" && packet.queue === "Standard"),
-    Low: packets.filter((packet) => packet.stage === "queued" && packet.queue === "Low"),
-  }), [packets]);
-
-  const activeNodesCount = useMemo(() => {
-    const mCount = masterStatus === 'online' ? 1 : 0;
-    const sCount = nodes.slaves.filter(s => s.status === 'online').length;
-    const cCount = nodes.clients.length;
-    return mCount + sCount + cCount;
-  }, [masterStatus, nodes.slaves, nodes.clients]);
-
-  const metrics = useMemo(() => ({
-    totalWrites: writeCount,
-    activeNodes: activeNodesCount,
-    staleFollowers: nodes.slaves.filter((slave) => slave.stale).length,
-    inFlight: packets.filter((p) => p.stage === "traveling" || p.stage === "client-to-node").length,
-  }), [activeNodesCount, nodes.slaves, packets, writeCount]);
-
+  // Scroll logs on update
   useEffect(() => {
     if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
-  }, [logs]);
+  }, [snap.logs]);
 
-  // Main Event Loop
+  // ── Slave offset catchup ────────────────────────────────────────────────────
   useEffect(() => {
-    const loop = window.setInterval(() => {
-      const now = Date.now();
-      const strongReady = [];
-      const staleMasterOffset = masterOffset;
-
-      setPackets((current) => {
-        const next = [];
-        const byStage = { Critical: [], Standard: [], Low: [] };
-
-        for (const packet of current) {
-          if (packet.stage === "client-to-node") {
-            const duration = packet.type === 'read' ? 1200 : 800; 
-            const progress = Math.min(1, (now - packet.dispatchedAt) / duration);
-            if (progress >= 1) {
-              if (packet.type === 'read') {
-                next.push({ ...packet, stage: "delivered", deliveredAt: now });
-              } else {
-                next.push({ ...packet, stage: "queued", queuedAt: now });
-              }
-            } else {
-              next.push({ ...packet, progress });
-            }
-          } else if (packet.stage === "queued") {
-            let queue = packet.queue;
-            let color = packet.color;
-            if (packet.queue === "Low" && now - packet.queuedAt > 3000) {
-              queue = "Standard";
-              color = priorityPalette.Aging;
-              if (!packet.aged) {
-                setLogs((entries) => [...entries, createLogEntry(`Aging promoted ${packet.id} from LOW to STD`, "warning")]);
-              }
-            }
-            byStage[queue].push({ ...packet, queue, color, aged: queue !== "Low" || packet.aged });
-          } else if (packet.stage === "traveling") {
-            const duration = packet.consistency === "Strong" ? 2600 : 1800;
-            const progress = Math.min(1, (now - packet.dispatchedAt) / duration);
-            const delivered = Math.floor(progress * packet.targetCount);
-            if (packet.consistency === "Strong" && delivered >= 6 && !packet.clientAcked) {
-              strongReady.push(packet.id);
-            }
-
-            if (progress >= 1) {
-              next.push({ ...packet, stage: "delivered", deliveredAt: now, deliveredTargets: packet.targetCount });
-            } else {
-              next.push({ ...packet, progress, deliveredTargets: delivered });
-            }
-          } else if (packet.stage === "delivered") {
-            if (now - packet.deliveredAt < 1400) {
-              next.push(packet);
-            }
-          }
-        }
-
-        // Only drain queues if master is ONLINE
-        if (masterStatus === "online") {
-          const weightedSchedule = ["Critical", "Critical", "Critical", "Critical", "Standard", "Standard", "Low"];
-          const availableQueue = weightedSchedule.find((tier) => byStage[tier].length > 0);
-          if (availableQueue) {
-            const [dispatched, ...rest] = byStage[availableQueue];
-            byStage[availableQueue] = rest;
-            next.push({
-              ...dispatched,
-              stage: "traveling",
-              progress: 0,
-              dispatchedAt: now,
-            });
-            // Update Master Offset & write count only when effectively replicated
-            setMasterOffset((o) => o + 1);
-            setWriteCount((c) => c + 1);
-          }
-        }
-
-        Object.values(byStage).flat().forEach((packet) => next.push(packet));
-        return next;
+    const id = setInterval(() => {
+      const s = S.current;
+      if (s.master.status !== 'online') return;
+      const mo = s.master.offset;
+      s.slaves = s.slaves.map(sl => {
+        if (sl.status !== 'online') return sl;
+        const step = Math.random() > 0.4 ? 1 : 0;
+        const off  = Math.min(mo, sl.offset + step);
+        return { ...sl, offset: off, stale: (mo - off) > 50 };
       });
+    }, 600);
+    return () => clearInterval(id);
+  }, []);
 
-      if (strongReady.length > 0) {
-        setWaitingStrong((current) => current.filter((id) => !strongReady.includes(id)));
-        setLogs((entries) => [
-          ...entries,
-          ...strongReady.map((id) => createLogEntry(`Strong write quorum met.`, "success")),
-        ]);
-        setPackets((current) => current.map((p) => strongReady.includes(p.id) ? { ...p, clientAcked: true } : p));
+  // ── Main simulation tick ────────────────────────────────────────────────────
+  useEffect(() => {
+    const id = setInterval(() => {
+      const s   = S.current;
+      const now = Date.now();
+
+      // 1. Advance packets + collect arrivals
+      const arrived = [];
+      const next    = [];
+      for (const p of s.packets) {
+        const dur  = p.duration ?? T.TRAVEL;
+        const prog = Math.min(1, (now - p.startedAt) / dur);
+        if (p.stage === 'done') {
+          if (now - p.doneAt < T.DONE_TTL) next.push(p);
+        } else if (prog >= 1) {
+          arrived.push(p);
+          next.push({ ...p, progress: 1, stage: 'done', doneAt: now });
+        } else {
+          next.push({ ...p, progress: prog });
+        }
+      }
+      s.packets = next;
+
+      // 2. Process arrivals
+      const newPkts = [];
+      for (const p of arrived) {
+
+        // ── Write arrives at Master ─────────────────────────────────────────
+        if (p.stage === 'fly_write') {
+          if (s.master.status === 'online') {
+            s.queue[p.priority] = [...s.queue[p.priority], { ...p, enqueuedAt: now }];
+          } else {
+            log(`[LOST] Write from ${p.clientId} — master offline`, 'error');
+          }
+        }
+
+        // ── Read arrives at Slave ───────────────────────────────────────────
+        else if (p.stage === 'fly_read') {
+          const sl = s.slaves.find(x => x.id === p.targetId);
+          const staleRejected = sl && sl.stale && p.consistency !== 'Bounded Staleness';
+          if (staleRejected) {
+            log(`[STALE_DATA] ${p.targetId}: lag ${s.master.offset - (sl?.offset ?? 0)} > 50. Rejected.`, 'warning');
+          } else {
+            s.readCount++;
+            log(`[GET → ${p.targetId}] ${sl?.stale ? 'OK (stale tolerated)' : 'OK'} consistency:${p.consistency}`, 'success');
+          }
+          const cNode = CLIENT_NODES.find(c => c.id === p.clientId) ?? CLIENT_NODES[0];
+          newPkts.push({
+            id: uid(), stage: 'fly_resp', progress: 0, startedAt: now,
+            duration: T.RESPONSE,
+            from: { x: sl?.x ?? MASTER_POS.x, y: sl?.y ?? MASTER_POS.y },
+            to:   { x: cNode.x, y: cNode.y },
+            color: staleRejected ? '#f87171' : '#34d399',
+          });
+        }
+
+        // ── Replication arrives at Slave ────────────────────────────────────
+        else if (p.stage === 'fly_repl') {
+          s.slaves = s.slaves.map(sl =>
+            sl.id === p.targetId
+              ? { ...sl, offset: Math.max(sl.offset, p.writeOffset) }
+              : sl
+          );
+          if (p.consistency === 'Strong' && s.strongMap[p.writeId]) {
+            s.strongMap[p.writeId].acks++;
+            const sm = s.strongMap[p.writeId];
+            if (sm.acks >= sm.required && !sm.resolved) {
+              sm.resolved = true;
+              log(`[QUORUM MET] offset ${p.writeOffset}: ${sm.acks}/${sm.required} ACKs. OK → client.`, 'success');
+              const cNode = CLIENT_NODES.find(c => c.id === sm.clientId) ?? CLIENT_NODES[0];
+              newPkts.push({
+                id: uid(), stage: 'fly_resp', progress: 0, startedAt: now,
+                duration: T.RESPONSE,
+                from: MASTER_POS,
+                to: { x: cNode.x, y: cNode.y },
+                color: '#34d399',
+              });
+            }
+          }
+        }
+        // fly_resp: no action needed on arrival
       }
 
-      setSlaves((current) =>
-        current.map((slave) => {
-          if (slave.id === masterId) return { ...slave, role: "master", status: masterStatus, stale: false };
-          const online = slave.status === "online";
-          const lag = staleMasterOffset - slave.offset;
-          return { ...slave, stale: online && lag > 2 };
-        })
-      );
-    }, 150);
+      s.packets = [...s.packets, ...newPkts];
 
-    return () => window.clearInterval(loop);
-  }, [masterId, masterOffset, masterStatus]);
+      // 3. Dispatch: pop one entry from priority queue every T.DISPATCH ms
+      if (s.master.status === 'online' && (now - s.lastDispatch) >= T.DISPATCH) {
+        let dispatched = null;
 
-  // Slave Sync Loop
-  useEffect(() => {
-    const syncLoop = window.setInterval(() => {
-      setSlaves((current) =>
-        current.map((slave) => {
-          if (slave.id === masterId || slave.status !== "online") return slave;
-          const catchup = Math.random() > 0.42 ? 1 : 0;
-          return { ...slave, offset: Math.min(masterOffset, slave.offset + catchup) };
-        })
-      );
-    }, 400);
-    return () => window.clearInterval(syncLoop);
-  }, [masterId, masterOffset]);
+        for (let i = 0; i < DISPATCH_SCHEDULE.length; i++) {
+          const tier = DISPATCH_SCHEDULE[s.schedIdx % DISPATCH_SCHEDULE.length];
+          s.schedIdx++;
+          if (s.queue[tier].length > 0) {
+            dispatched = s.queue[tier][0];
+            s.queue[tier] = s.queue[tier].slice(1);
+            break;
+          }
+        }
+        if (!dispatched) {
+          for (const tier of ['Critical', 'Standard', 'Low']) {
+            if (s.queue[tier].length > 0) {
+              dispatched = s.queue[tier][0];
+              s.queue[tier] = s.queue[tier].slice(1);
+              break;
+            }
+          }
+        }
 
-  function appendLog(message, tone = "info") {
-    setLogs((current) => [...current, createLogEntry(message, tone)]);
-  }
+        if (dispatched) {
+          s.master.offset++;
+          s.writeCount++;
+          s.lastDispatch = now;
+          const newOffset = s.master.offset;
+          const onSlaves  = s.slaves.filter(sl => sl.status === 'online');
+          log(`[DISPATCH] ${dispatched.priority} write → offset ${newOffset} → ${onSlaves.length} replicas`, dispatched.priority === 'Critical' ? 'critical' : 'info');
 
-  function injectTraffic({ qty, type, priority, consistency }) {
-    if (type === "write" && masterStatus !== "online") {
-      appendLog("Master is offline. Writes queued until failover completes.", "warning");
-    }
+          // Fan-out replication to all online slaves
+          for (const sl of onSlaves) {
+            s.packets.push({
+              id: uid(), stage: 'fly_repl', progress: 0, startedAt: now,
+              duration: T.TRAVEL,
+              from: MASTER_POS,
+              to:   { x: sl.x, y: sl.y },
+              color: PRIORITY_COLORS[dispatched.priority],
+              targetId: sl.id,
+              writeId:  dispatched.id,
+              writeOffset: newOffset,
+              consistency: dispatched.consistency,
+            });
+          }
 
-    const activeSlaves = slaves.filter(s => s.status === 'online' && s.id !== masterId);
-    if (type === "read" && activeSlaves.length === 0) {
-      appendLog("No active followers available for READ.", "error");
+          if (dispatched.consistency !== 'Strong') {
+            const cNode = CLIENT_NODES.find(c => c.id === dispatched.clientId) ?? CLIENT_NODES[0];
+            s.packets.push({
+              id: uid(), stage: 'fly_resp', progress: 0, startedAt: now,
+              duration: T.RESPONSE,
+              from: MASTER_POS,
+              to: { x: cNode.x, y: cNode.y },
+              color: '#34d399',
+            });
+          } else {
+            const required = Math.max(1, Math.floor(onSlaves.length / 2) + 1);
+            s.strongMap[dispatched.id] = { acks: 0, required, clientId: dispatched.clientId, resolved: false };
+            log(`[STRONG] Waiting for ${required}/${onSlaves.length} ACKs before responding…`, 'warning');
+          }
+        }
+      }
+
+      // 4. Aging: promote packets in queue
+      {
+        const critNew = [...s.queue.Critical];
+        const stdNew  = [];
+        const lowNew  = [];
+
+        for (const p of s.queue.Standard) {
+          const age = now - (p.agedAt ?? p.enqueuedAt ?? now);
+          if (age >= T.AGE_2) {
+            log(`[AGING] Standard→Critical: ${p.id.slice(-6)} (${(age/1000).toFixed(1)}s in queue)`, 'warning');
+            critNew.push({ ...p, priority: 'Critical', color: PRIORITY_COLORS.Critical, agedAt: now });
+          } else {
+            stdNew.push(p);
+          }
+        }
+        for (const p of s.queue.Low) {
+          const age = now - (p.enqueuedAt ?? now);
+          if (age >= T.AGE_1) {
+            log(`[AGING] Low→Standard: ${p.id.slice(-6)} (${(age/1000).toFixed(1)}s in queue)`, 'warning');
+            stdNew.push({ ...p, priority: 'Standard', color: PRIORITY_COLORS.Standard, agedAt: now, enqueuedAt: now });
+          } else {
+            lowNew.push(p);
+          }
+        }
+        s.queue = { Critical: critNew, Standard: stdNew, Low: lowNew };
+      }
+
+      // 5. Snapshot for rendering (shallow copy triggers re-render)
+      setSnap({
+        master:     { ...s.master },
+        slaves:     s.slaves,
+        queue:      { Critical: s.queue.Critical, Standard: s.queue.Standard, Low: s.queue.Low },
+        packets:    s.packets,
+        writeCount: s.writeCount,
+        readCount:  s.readCount,
+        logs:       s.logs,
+        strongMap:  s.strongMap,
+      });
+    }, T.TICK);
+    return () => clearInterval(id);
+  }, []);
+
+  // ── Actions ───────────────────────────────────────────────────────────────────
+  const injectTraffic = useCallback(({ qty, type, priority, consistency }) => {
+    const s   = S.current;
+    const now = Date.now();
+    const onSlaves = s.slaves.filter(sl => sl.status === 'online');
+
+    if (type === 'read' && onSlaves.length === 0) {
+      log('No online slaves for reads.', 'error');
       return;
     }
-
-    const newPackets = [];
-    const now = Date.now();
-
-    for(let i=0; i < qty; i++) {
-        const client = backgroundClients[Math.floor(Math.random() * backgroundClients.length)];
-        const packetId = `${now}-${Math.random().toString(16).slice(2)}`;
-        
-        if (type === "read") {
-            const slave = activeSlaves[Math.floor(Math.random() * activeSlaves.length)];
-            newPackets.push({
-                id: packetId,
-                type: "read",
-                source: client.id,
-                targetId: slave.id,
-                color: "#dbe7ff", // White/Blue for reads
-                stage: "client-to-node",
-                createdAt: now,
-                dispatchedAt: now,
-            });
-        } else {
-            newPackets.push({
-                id: packetId,
-                type: "write",
-                queue: priority,
-                consistency: consistency,
-                source: client.id,
-                color: priorityPalette[priority],
-                stage: "client-to-node",
-                createdAt: now,
-                dispatchedAt: now,
-                queuedAt: now,
-                targetCount: 10,
-                clientAcked: consistency !== "Strong",
-                aged: false,
-            });
-        }
+    if (type === 'write' && s.master.status !== 'online') {
+      log(`Master offline — writes will be LOST on arrival.`, 'warning');
     }
 
-    setPackets((current) => [...current, ...newPackets]);
+    for (let i = 0; i < qty; i++) {
+      const client = CLIENT_NODES[Math.floor(Math.random() * CLIENT_NODES.length)];
+      const pkt = {
+        id: uid(), progress: 0, startedAt: now + i * 80, duration: T.TRAVEL,
+        clientId: client.id,
+        from:     { x: client.x, y: client.y },
+      };
 
-    if(type === 'read') {
-        appendLog(`Spawned ${qty} READ(s) directly to slaves.`, "info");
-    } else {
-        appendLog(`Spawned ${qty} WRITE(s) to Master [${priority}].`, priority === "Critical" ? "critical" : "info");
-        if (consistency === "Strong") {
-            const newStrongIds = newPackets.map(p => p.id);
-            setWaitingStrong((c) => [...c, ...newStrongIds]);
-        }
-    }
-  }
-
-  function killMaster() {
-    if (masterStatus === "offline") return;
-
-    setMasterStatus("offline");
-    setVotePulse(true);
-    appendLog("Chaos Monkey triggered. Master marked OFFLINE.", "error");
-
-    window.setTimeout(() => {
-      appendLog("Heartbeat timeout. Followers entering CANDIDATE state.", "warning");
-      setSlaves((current) =>
-        current.map((slave) =>
-          slave.id === masterId ? slave : { ...slave, votes: Math.floor(Math.random() * 3) + 1 }
-        )
-      );
-    }, 800);
-
-    window.setTimeout(() => {
-      const promoted = slaves
-        .filter((slave) => slave.id !== masterId && slave.status === "online")
-        .sort((a,b) => b.offset - a.offset)[0]; // Promote the one with highest offset
-
-      if (!promoted) {
-        appendLog("No follower available for promotion.", "error");
-        return;
+      if (type === 'write') {
+        s.packets.push({
+          ...pkt,
+          stage:       'fly_write',
+          priority,
+          consistency,
+          color:       PRIORITY_COLORS[priority],
+          to:          MASTER_POS,
+        });
+      } else {
+        const sl = onSlaves[Math.floor(Math.random() * onSlaves.length)];
+        s.packets.push({
+          ...pkt,
+          stage:       'fly_read',
+          consistency,
+          color:       consistency === 'Strong' ? '#a78bfa' : '#94a3b8',
+          targetId:    sl.id,
+          to:          { x: sl.x, y: sl.y },
+        });
       }
+    }
 
-      setMasterId(promoted.id);
-      setMasterStatus("online");
-      setVotePulse(false);
-      setSlaves((current) =>
-        current.map((slave) => {
-          if (slave.id === masterId) {
-             return { ...slave, status: "offline", role: "slave", votes: 0 };
-          }
-          if (slave.id === promoted.id) {
-             return { ...slave, status: "online", role: "master", offset: masterOffset, votes: 7 };
-          }
-          return { ...slave, role: "slave", votes: 0 };
-        })
+    log(
+      type === 'write'
+        ? `[SET] ${qty} × ${priority} write(s) [${consistency}] → Master`
+        : `[GET] ${qty} read(s) → slaves (master bypassed)`,
+      'info'
+    );
+  }, []);
+
+  const killMaster = useCallback(() => {
+    const s = S.current;
+    if (s.master.status !== 'online') return;
+
+    s.master.status = 'electing';
+    log('[CRASH] Master process killed. In-memory queue WIPED.', 'error');
+    log('[CRASH] All queued + in-flight writes to master are LOST.', 'error');
+
+    // Wipe queue and mark in-flight writes as lost (done immediately)
+    s.queue   = { Critical: [], Standard: [], Low: [] };
+    s.packets = s.packets.map(p =>
+      p.stage === 'fly_write'
+        ? { ...p, stage: 'done', doneAt: Date.now(), color: '#ef4444' }
+        : p
+    );
+
+    // Step 1: slaves detect missing heartbeat
+    setTimeout(() => {
+      log(`Heartbeat timeout (${T.HEARTBEAT}ms). Slaves enter CANDIDATE state.`, 'warning');
+      S.current.slaves = S.current.slaves.map(sl =>
+        sl.status === 'online' ? { ...sl, votes: Math.floor(Math.random() * 5) + 1 } : sl
       );
-      appendLog(`Election Settled: ${promoted.label} promoted to MASTER.`, "success");
-    }, 2000);
-  }
+    }, T.HEARTBEAT);
 
-  return {
-    nodes,
-    masterStatus,
-    metrics,
-    queueState,
-    waitingStrong,
-    votePulse,
-    injectTraffic,
-    killMaster,
-    packets,
-    logs,
-    logRef,
-    masterOffset
+    // Step 2: election resolves — slave with highest offset wins
+    setTimeout(() => {
+      const candidates = S.current.slaves.filter(sl => sl.status === 'online');
+      if (candidates.length === 0) { log('No candidates! Cluster unavailable.', 'error'); return; }
+
+      const winner = candidates.reduce((best, sl) => sl.offset > best.offset ? sl : best);
+      const newTerm = S.current.master.term + 1;
+
+      S.current.master = { status: 'online', offset: winner.offset, term: newTerm, electingFrom: winner.id };
+      S.current.slaves = S.current.slaves.map(sl => ({ ...sl, votes: 0 }));
+
+      log(`[ELECTION T${newTerm}] ${winner.label} promoted to acting master (offset ${winner.offset}).`, 'success');
+      log(`[NEW_MASTER] Broadcast complete. All slaves following ${winner.label}.`, 'success');
+    }, T.ELECTION);
+  }, []);
+
+  // ── Derived metrics (16/16 — master is separate from 10 slaves) ──────────────
+  const metrics = {
+    totalNodes:  5 + 1 + 10,  // clients + master + slaves = 16
+    activeNodes: 5 + (snap.master.status === 'online' ? 1 : 0) + snap.slaves.filter(s => s.status === 'online').length,
+    stale:       snap.slaves.filter(s => s.stale).length,
+    queueDepth:  snap.queue.Critical.length + snap.queue.Standard.length + snap.queue.Low.length,
+    inFlight:    snap.packets.filter(p => p.stage !== 'done').length,
+    strongPendingCount: Object.values(snap.strongMap).filter(v => !v.resolved).length,
   };
+
+  return { snap, metrics, logRef, injectTraffic, killMaster };
 }

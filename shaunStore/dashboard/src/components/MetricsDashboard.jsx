@@ -1,42 +1,44 @@
 import React from 'react';
 
-export default function MetricsDashboard({ metrics, masterStatus, waitingStrong }) {
-  const cards = [
-    {
-      title: "Total Writes",
-      value: metrics.totalWrites,
-      caption: "replicated via master",
-      accent: "from-sky-500/30 to-sky-300/5",
-    },
-    {
-      title: "Active Nodes",
-      value: `${metrics.activeNodes}/16`, // 5 clients + 1 master + 10 slaves
-      caption: `${metrics.staleFollowers} follower(s) stale`,
-      accent: "from-emerald-500/30 to-emerald-300/5",
-    },
-    {
-      title: "Master Status",
-      value: masterStatus === "online" ? "HEALTHY" : "FAILED",
-      caption: waitingStrong.length > 0 ? `${waitingStrong.length} strong ACK(s) pending` : "no quorum waits",
-      accent: waitingStrong.length > 0 ? "from-yellow-500/35 to-yellow-300/10" : "from-indigo-500/30 to-indigo-300/5",
-    },
-    {
-      title: "In Flight",
-      value: metrics.inFlight,
-      caption: "packets in motion",
-      accent: "from-orange-500/30 to-orange-300/5",
-    },
-  ];
-
+function Stat({ label, value, sub, tone='default' }) {
+  const border = { red:'border-red-500/30', yellow:'border-yellow-400/30', green:'border-emerald-500/30', default:'border-white/10' }[tone];
+  const color  = { red:'text-red-300', yellow:'text-yellow-200', green:'text-emerald-300', default:'text-white' }[tone];
   return (
-    <header className="grid gap-4 md:grid-cols-4">
-      {cards.map((card, i) => (
-        <div key={i} className={`rounded-3xl border border-white/10 bg-gradient-to-br ${card.accent} p-4 shadow-neon backdrop-blur`}>
-          <div className="text-xs uppercase tracking-[0.28em] text-white/65">{card.title}</div>
-          <div className="mt-3 text-3xl font-semibold">{card.value}</div>
-          <div className="mt-2 text-sm text-white/60">{card.caption}</div>
-        </div>
-      ))}
-    </header>
+    <div className={`rounded-2xl border bg-zinc-900/70 p-4 ${border}`}>
+      <div className="text-[9px] font-semibold uppercase tracking-widest text-zinc-500">{label}</div>
+      <div className={`mt-2 text-2xl font-bold tabular-nums ${color}`}>{value}</div>
+      {sub && <div className="mt-1 text-[10px] text-zinc-600">{sub}</div>}
+    </div>
+  );
+}
+
+export default function MetricsDashboard({ snap, metrics }) {
+  const { master } = snap;
+  const crashed  = master.status === 'electing';
+  const offline  = master.status !== 'online';
+  return (
+    <div className="grid grid-cols-3 gap-3 lg:grid-cols-6">
+      <Stat label="Writes Applied" value={snap.writeCount} sub="committed to master log" />
+      <Stat label="Reads Served"   value={snap.readCount}  sub="via slaves (master bypassed)" />
+      <Stat
+        label="Active Nodes"
+        value={`${metrics.activeNodes}/${metrics.totalNodes}`}
+        sub={`${metrics.stale} stale slave(s)`}
+        tone={offline ? 'red' : 'default'}
+      />
+      <Stat
+        label="Master"
+        value={offline ? (crashed ? 'ELECTING' : 'OFFLINE') : 'ONLINE'}
+        sub={`term ${master.term} · offset ${master.offset}`}
+        tone={crashed ? 'yellow' : offline ? 'red' : 'green'}
+      />
+      <Stat label="Queue Depth"     value={metrics.queueDepth} sub="in priority queue" />
+      <Stat
+        label="Strong Pending"
+        value={metrics.strongPendingCount}
+        sub="awaiting quorum ACK"
+        tone={metrics.strongPendingCount > 0 ? 'yellow' : 'default'}
+      />
+    </div>
   );
 }
