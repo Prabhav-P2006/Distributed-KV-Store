@@ -13,8 +13,6 @@
 #include <random>
 #include <stdexcept>
 #include <sys/socket.h>
-#include <unistd.h>
-
 namespace {
 std::string toLower(std::string value) {
     std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {

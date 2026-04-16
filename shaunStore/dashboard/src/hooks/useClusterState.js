@@ -39,30 +39,48 @@ export function useClusterState() {
   const logRef  = useRef(null);               // DOM ref for log scroll
   const [snap, setSnap] = useState(S.current); // snapshot for rendering
 
-  // Push a log entry
-  function log(msg, tone = 'info') {
+  // Push a log entry — nodeId must match /tmp/shaunstore-logs/<nodeId>.log
+  // Valid values: 'master', 'slave-8001'..'slave-8010', 'client-1'..'client-5'
+  function log(msg, tone = 'info', nodeId = 'master') {
     const s = S.current;
     s.logs = [...s.logs.slice(-300), mkLog(msg, tone)];
+    fetch('http://localhost:3001/log', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ node: nodeId, msg })
+    }).catch(() => {});
   }
+
+  // Helper: convert slave ID (S1..S10) → log file name (slave-8001..slave-8010)
+  const slaveLogId = (id) => `slave-${8000 + parseInt(id.slice(1))}`;
+  // Helper: convert client ID (C1..C5) → log file name (client-1..client-5)
+  const clientLogId = (id) => `client-${id.slice(1)}`;
+
 
   // Scroll logs on update
   useEffect(() => {
     if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
   }, [snap.logs]);
-
-  // ── Slave offset catchup ────────────────────────────────────────────────────
+  // ── Slave offset catchup / Heartbeats ───────────────────────────────────────
   useEffect(() => {
     const id = setInterval(() => {
       const s = S.current;
       if (s.master.status !== 'online') return;
+      
+      log("Heartbeat sent to all replicas", "info", "master");
+
       const mo = s.master.offset;
       s.slaves = s.slaves.map(sl => {
         if (sl.status !== 'online') return sl;
-        const step = Math.random() > 0.4 ? 1 : 0;
+        
+        const slavePort = 8000 + parseInt(sl.id.slice(1));
+        log(`Received heartbeat from master (Offset: ${mo})`, "info", `slave-${slavePort}`);
+
+        const step = Math.random() > 0.4 ? 1 : 1; // Faster catchup for demo
         const off  = Math.min(mo, sl.offset + step);
         return { ...sl, offset: off, stale: (mo - off) > 50 };
       });
-    }, 600);
+    }, 3000);
     return () => clearInterval(id);
   }, []);
 
@@ -97,8 +115,11 @@ export function useClusterState() {
         if (p.stage === 'fly_write') {
           if (s.master.status === 'online') {
             s.queue[p.priority] = [...s.queue[p.priority], { ...p, enqueuedAt: now }];
+            log(`[INCOMING] ${p.priority} write from ${p.clientId} [${p.consistency}] enqueued`, 'info', 'master');
+            log(`[SET] Sent ${p.priority} write [${p.consistency}] → Master`, 'info', clientLogId(p.clientId));
           } else {
-            log(`[LOST] Write from ${p.clientId} — master offline`, 'error');
+            log(`[LOST] Write from ${p.clientId} — master offline`, 'error', 'master');
+            log(`[ERR] Write failed — master offline`, 'error', clientLogId(p.clientId));
           }
         }
 
@@ -107,10 +128,12 @@ export function useClusterState() {
           const sl = s.slaves.find(x => x.id === p.targetId);
           const staleRejected = sl && sl.stale && p.consistency !== 'Bounded Staleness';
           if (staleRejected) {
-            log(`[STALE_DATA] ${p.targetId}: lag ${s.master.offset - (sl?.offset ?? 0)} > 50. Rejected.`, 'warning');
+            log(`[STALE_DATA] lag ${s.master.offset - (sl?.offset ?? 0)} > 50. Rejected.`, 'warning', slaveLogId(p.targetId));
+            log(`[ERR] STALE_DATA from ${p.targetId}`, 'warning', clientLogId(p.clientId));
           } else {
             s.readCount++;
-            log(`[GET → ${p.targetId}] ${sl?.stale ? 'OK (stale tolerated)' : 'OK'} consistency:${p.consistency}`, 'success');
+            log(`[GET] Served read OK${sl?.stale ? ' (stale tolerated)' : ''} consistency:${p.consistency}`, 'success', slaveLogId(p.targetId));
+            log(`[GET] Response received from ${p.targetId} ✓`, 'success', clientLogId(p.clientId));
           }
           const cNode = CLIENT_NODES.find(c => c.id === p.clientId) ?? CLIENT_NODES[0];
           newPkts.push({
@@ -129,12 +152,18 @@ export function useClusterState() {
               ? { ...sl, offset: Math.max(sl.offset, p.writeOffset) }
               : sl
           );
+
+          const slaveNode = slaveLogId(p.targetId);
+          log(`[REPL_WRITE] Applied offset ${p.writeOffset} priority:${p.priority ?? 'Standard'}`, 'info', slaveNode);
+          log(`[ACK] Sent ACK for offset ${p.writeOffset} → Master`, 'info', slaveNode);
+
           if (p.consistency === 'Strong' && s.strongMap[p.writeId]) {
             s.strongMap[p.writeId].acks++;
             const sm = s.strongMap[p.writeId];
             if (sm.acks >= sm.required && !sm.resolved) {
               sm.resolved = true;
-              log(`[QUORUM MET] offset ${p.writeOffset}: ${sm.acks}/${sm.required} ACKs. OK → client.`, 'success');
+              log(`[QUORUM MET] offset ${p.writeOffset}: ${sm.acks}/${sm.required} ACKs. Responding to client.`, 'success', 'master');
+              log(`[OK] Strong write confirmed (offset ${p.writeOffset})`, 'success', clientLogId(sm.clientId));
               const cNode = CLIENT_NODES.find(c => c.id === sm.clientId) ?? CLIENT_NODES[0];
               newPkts.push({
                 id: uid(), stage: 'fly_resp', progress: 0, startedAt: now,
@@ -180,7 +209,11 @@ export function useClusterState() {
           s.lastDispatch = now;
           const newOffset = s.master.offset;
           const onSlaves  = s.slaves.filter(sl => sl.status === 'online');
-          log(`[DISPATCH] ${dispatched.priority} write → offset ${newOffset} → ${onSlaves.length} replicas`, dispatched.priority === 'Critical' ? 'critical' : 'info');
+          log(`[DISPATCH] ${dispatched.priority} → offset ${newOffset} → ${onSlaves.length} replicas`, dispatched.priority === 'Critical' ? 'critical' : 'info', 'master');
+          log(`[REPL_START] Broadcasting offset ${newOffset} to ${onSlaves.length} slaves`, 'info', 'master');
+          if (dispatched.consistency !== 'Strong') {
+            log(`[OK] Eventual write acknowledged (offset ${newOffset})`, 'success', clientLogId(dispatched.clientId));
+          }
 
           // Fan-out replication to all online slaves
           for (const sl of onSlaves) {
@@ -209,7 +242,8 @@ export function useClusterState() {
           } else {
             const required = Math.max(1, Math.floor(onSlaves.length / 2) + 1);
             s.strongMap[dispatched.id] = { acks: 0, required, clientId: dispatched.clientId, resolved: false };
-            log(`[STRONG] Waiting for ${required}/${onSlaves.length} ACKs before responding…`, 'warning');
+            log(`[STRONG] Waiting for ${required}/${onSlaves.length} ACKs before responding`, 'warning', 'master');
+            log(`[WAIT] Awaiting quorum (${required} ACKs needed)`, 'warning', clientLogId(dispatched.clientId));
           }
         }
       }
@@ -278,6 +312,8 @@ export function useClusterState() {
         from:     { x: client.x, y: client.y },
       };
 
+      const cLogId = clientLogId(client.id);
+
       if (type === 'write') {
         s.packets.push({
           ...pkt,
@@ -287,6 +323,7 @@ export function useClusterState() {
           color:       PRIORITY_COLORS[priority],
           to:          MASTER_POS,
         });
+        log(`[SET] Sending ${priority} write [${consistency}] → Master`, 'info', cLogId);
       } else {
         const sl = onSlaves[Math.floor(Math.random() * onSlaves.length)];
         s.packets.push({
@@ -297,15 +334,14 @@ export function useClusterState() {
           targetId:    sl.id,
           to:          { x: sl.x, y: sl.y },
         });
+        log(`[GET] Sending read [${consistency}] → ${sl.id}`, 'info', cLogId);
       }
     }
 
-    log(
-      type === 'write'
-        ? `[SET] ${qty} × ${priority} write(s) [${consistency}] → Master`
-        : `[GET] ${qty} read(s) → slaves (master bypassed)`,
-      'info'
-    );
+    const logMsg = type === 'write'
+        ? `[SET] ${qty} × ${priority} write(s) [${consistency}] injected`
+        : `[GET] ${qty} read(s) injected → slaves`;
+    log(logMsg, 'info', 'master');
   }, []);
 
   const killMaster = useCallback(() => {
@@ -326,25 +362,32 @@ export function useClusterState() {
 
     // Step 1: slaves detect missing heartbeat
     setTimeout(() => {
-      log(`Heartbeat timeout (${T.HEARTBEAT}ms). Slaves enter CANDIDATE state.`, 'warning');
-      S.current.slaves = S.current.slaves.map(sl =>
-        sl.status === 'online' ? { ...sl, votes: Math.floor(Math.random() * 5) + 1 } : sl
-      );
+      log(`[TIMEOUT] Heartbeat timeout. Entering CANDIDATE state.`, 'warning', 'master');
+      S.current.slaves = S.current.slaves.map(sl => {
+        if (sl.status === 'online') {
+          log(`[ELECTION] Heartbeat timeout detected. Becoming CANDIDATE.`, 'warning', slaveLogId(sl.id));
+          return { ...sl, votes: Math.floor(Math.random() * 5) + 1 };
+        }
+        return sl;
+      });
     }, T.HEARTBEAT);
 
     // Step 2: election resolves — slave with highest offset wins
     setTimeout(() => {
       const candidates = S.current.slaves.filter(sl => sl.status === 'online');
-      if (candidates.length === 0) { log('No candidates! Cluster unavailable.', 'error'); return; }
+      if (candidates.length === 0) { log('No candidates! Cluster unavailable.', 'error', 'master'); return; }
 
       const winner = candidates.reduce((best, sl) => sl.offset > best.offset ? sl : best);
       const newTerm = S.current.master.term + 1;
 
       S.current.master = { status: 'online', offset: winner.offset, term: newTerm, electingFrom: winner.id };
-      S.current.slaves = S.current.slaves.map(sl => ({ ...sl, votes: 0 }));
+      S.current.slaves = S.current.slaves.map(sl => {
+        log(`[NEW_MASTER] Following new master ${winner.id} for term ${newTerm}`, 'success', slaveLogId(sl.id));
+        return { ...sl, votes: 0 };
+      });
 
-      log(`[ELECTION T${newTerm}] ${winner.label} promoted to acting master (offset ${winner.offset}).`, 'success');
-      log(`[NEW_MASTER] Broadcast complete. All slaves following ${winner.label}.`, 'success');
+      log(`[ELECTION T${newTerm}] ${winner.label} promoted to acting master (offset ${winner.offset}).`, 'success', 'master');
+      log(`[PROMOTED] Now acting as MASTER for term ${newTerm} (offset ${winner.offset})`, 'success', slaveLogId(winner.id));
     }, T.ELECTION);
   }, []);
 
