@@ -13,9 +13,10 @@
 #include <thread>
 #include <vector>
 
-class PriorityReplicationEngine {
+class PriorityReplicationEngine
+{
 public:
-    explicit PriorityReplicationEngine(const Config& config);
+    explicit PriorityReplicationEngine(const Config &config);
     ~PriorityReplicationEngine();
 
     void start();
@@ -25,7 +26,8 @@ public:
     [[nodiscard]] std::size_t size() const;
 
 private:
-    enum class Tier {
+    enum class Tier
+    {
         Critical,
         Standard,
         Low
@@ -36,7 +38,7 @@ private:
     std::optional<ReplicationEntry> popFromTierLocked(Tier tier);
     std::optional<ReplicationEntry> popAnyLocked();
 
-    const Config& config_;
+    const Config &config_;
     mutable std::shared_mutex queue_mutex_;
     std::deque<ReplicationEntry> critical_queue_;
     std::list<ReplicationEntry> standard_queue_;
@@ -45,10 +47,10 @@ private:
     std::mutex signal_mutex_;
     std::condition_variable signal_cv_;
     std::thread aging_thread_;
-    std::atomic<bool> running_ {false};
+    std::atomic<bool> running_{false};
 
     std::vector<Tier> dispatch_schedule_;
-    std::size_t schedule_index_ {0};
+    std::size_t schedule_index_{0};
 };
 
 #endif

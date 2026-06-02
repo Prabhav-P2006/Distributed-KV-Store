@@ -27,14 +27,8 @@ with socket.create_connection((host, port), timeout=3) as sock:
     sock.settimeout(1.0)
     sock.sendall(payload.encode("utf-8"))
     response = bytearray()
-    while True:
-        try:
-            chunk = sock.recv(4096)
-        except TimeoutError:
-            break
-        if not chunk:
-            break
-        response.extend(chunk)
+    chunk = sock.recv(4096)
+    response.extend(chunk)
 
 sys.stdout.write(response.decode("utf-8", errors="replace"))
 PY

@@ -1,88 +1,277 @@
 # shaunStore: Distributed Key-Value Store
 
-shaunStore is a Redis-inspired distributed key-value store supporting concurrent client requests, in-memory caching, and low-latency distributed data access across master-slave node clusters.
+shaunStore is a Redis-inspired distributed key-value store built in C++. It supports distributed replication, adaptive consistency models, leader election, and concurrent client request handling using custom TCP socket communication.
 
-## 📌 Project Statement
-To develop a high-performance, distributed key-value store that supports fault-tolerant replication, Raft-style leader election, and high concurrent throughput using custom TCP-socket communication.
+---
 
-## 📚 Background
-Scalable and highly available data storage is critical for modern distributed systems. While tools like Redis offer robust solutions, understanding the underlying mechanisms of distributed consensus, asynchronous replication, and non-blocking I/O is crucial. This project implements a master-slave cluster architecture from scratch, introducing adaptive consistency models and aging-based priority queues to improve data consistency and scalability in high-concurrency environments.
+# Features
 
-## 🔧 Methodology
-### Techniques & Approach
-- **Master-Slave Architecture** for distributed data access and redundancy.
-- **Non-Blocking I/O** using `epoll` (or equivalent) for handling multiple connections on a single thread.
-- **Raft-Style Leader Election** for fault-tolerant node management and high availability.
-- **RESP (Redis Serialization Protocol)** for efficient client-server communication.
-- **Asynchronous Replication** with a priority queue-based engine to keep slave nodes in sync.
+* Distributed Master-Slave Architecture
+* In-Memory Key-Value Storage
+* Custom TCP Socket Communication
+* RESP (Redis Serialization Protocol) Support
+* Adaptive Consistency Models
 
-## 🖼️ System Architecture
-- **Core Node Phase:** Established a single-node in-memory KV, List, and Hash store.
-- **Multi-Node Cluster:** Implemented custom TCP socket-based communication to form master-slave configurations.
-- **Replication & Election:** Integrated fault-tolerant replication workflows and election mechanisms to handle simulated node failures.
+  * Strong Consistency
+  * Eventual Consistency
+  * Bounded Staleness
+* Priority-Based Replication Scheduling
 
-## 🛠 Tools & Technologies
-- **Languages:** C++
-- **Networking:** TCP Sockets
-- **Build Tools:** Makefile
+  * Critical
+  * Standard
+  * Low
+* Aging-Based Queue Promotion to Prevent Starvation
+* Replication Backlog Recovery
+* Raft-Style Leader Election
+* Heartbeat-Based Failure Detection
+* Multi-Threaded Cluster Management
+* Thread-Safe Data Storage using Shared Mutexes
 
-## 🧰 Prerequisites
-Make sure you are using Linux or macOS.
-- G++ Compiler (C++17 or higher)
+---
 
-## 📦 Getting Started
-First, clone the main repository:
+# Project Objective
 
-```bash
-git clone https://github.com/Prabhav-P2006/Distributed-KV-Store.git
-cd Distributed-KV-Store
+Modern distributed systems require high availability, fault tolerance, and scalable data access. The objective of shaunStore is to demonstrate how these properties can be implemented from scratch using fundamental distributed systems concepts.
+
+The project focuses on:
+
+* Distributed replication
+* Fault-tolerant leader election
+* Consistency management
+* Concurrent request processing
+* Recovery from node failures
+
+---
+
+## Components
+
+### ClusterNode
+
+Core distributed systems component responsible for:
+
+* Client communication
+* Replication
+* Heartbeats
+* Leader election
+* Failure recovery
+
+### Database
+
+Thread-safe in-memory key-value store built using:
+
+```cpp
+std::unordered_map<std::string, std::string>
 ```
 
-## ⚙️ Backend Server Setup
-### 🔧 Build the Server
-Inside the project directory, navigate to the server directory and build:
+Protected by:
+
+```cpp
+std::shared_mutex
+```
+
+to allow concurrent reads.
+
+### PriorityReplicationEngine
+
+Handles asynchronous replication using three priority levels:
+
+```text
+Critical
+Standard
+Low
+```
+
+Operations are scheduled using configurable weights and promoted through aging to prevent starvation.
+
+### Protocol Layer
+
+Implements RESP parsing and encoding for communication between:
+
+* Clients and servers
+* Masters and replicas
+
+---
+
+# Replication Workflow
+
+```text
+Client
+  |
+SET key value
+  |
+Master Database Update
+  |
+Create ReplicationEntry
+  |
+PriorityReplicationEngine
+  |
+Dispatcher Thread
+  |
+Replica Nodes
+  |
+Acknowledgement
+```
+
+Each write operation receives a replication offset that allows replicas to:
+
+* Track synchronization state
+* Recover missing operations
+* Support bounded staleness checks
+
+---
+
+# Leader Election
+
+shaunStore implements a Raft-inspired leader election mechanism.
+
+## Election Flow
+
+```text
+Heartbeat Timeout
+        |
+     Candidate
+        |
+ Increase Term
+        |
+ Request Votes
+        |
+ Majority Votes
+        |
+ Become Master
+```
+
+Followers monitor periodic heartbeats from the leader.
+
+If heartbeats stop arriving before the configured election timeout, a new election is triggered automatically.
+
+---
+
+# Consistency Models
+
+## Eventual Consistency
+
+The master acknowledges writes immediately.
+
+Replication occurs asynchronously.
+
+Provides the highest throughput.
+
+---
+
+## Strong Consistency
+
+The master waits for acknowledgements from replicas before confirming a write.
+
+Provides stronger correctness guarantees.
+
+---
+
+## Bounded Staleness
+
+Allows replica reads while limiting acceptable replication lag.
+
+Prevents serving excessively stale data.
+
+---
+
+# Technologies Used
+
+| Category        | Technology                                   |
+| --------------- | -------------------------------------------- |
+| Language        | C++20                                        |
+| Networking      | TCP Sockets                                  |
+| Concurrency     | std::thread                                  |
+| Synchronization | Mutexes, Shared Mutexes, Condition Variables |
+| Protocol        | RESP                                         |
+| Build System    | Make                                         |
+| Data Structures | STL Containers                               |
+
+---
+
+
+# Building
+
+## Prerequisites
+
+* Linux or macOS
+* C++20 Compatible Compiler
+* Make
+
+## Build
 
 ```bash
-cd shaunStore/server
+cd shaunStore
 make
 ```
 
-### ▶️ Run the Cluster Nodes
-Run the following components to start your cluster:
+The executable is generated as:
 
-**🧩 Master Node**
 ```bash
-./build/shaunStore --config tmp-manual/master.json
+./server
 ```
 
-**🖥️ Slave Nodes**
+---
+
+# Running the Cluster
+
+## Start Master
+
 ```bash
-./build/shaunStore --config tmp-manual/slave-8001.json
-./build/shaunStore --config tmp-manual/slave-8002.json
+./server tmp-manual/master.json
 ```
 
-*(Alternatively, use the provided launch script to start the cluster automatically: `./scripts/launch-terminal-cluster.sh`)*
+## Start Slave 1
 
-## ✅ Verify Cluster Status
-Connect to the master node using the RESP client or standard `nc`:
 ```bash
-./scripts/resp_client.sh 127.0.0.1 8000
-```
-Try running some commands:
-```
-PING
-SET mykey "Hello Distributed World"
-GET mykey
+./server tmp-manual/slave-8001.json
 ```
 
-## 📈 Results & Analysis
-### ✅ Key Outcomes
-- Seamless distributed replication and automated leader election.
-- Efficient processing of 1000+ concurrent operations across distributed nodes.
+## Start Slave 2
 
-### 📊 Performance Metrics
-- **Throughput:** Maximized through non-blocking event loops and optimized memory access.
-- **Scalability:** Stable performance utilizing three-level synchronization mechanisms across multi-node setups.
+```bash
+./server tmp-manual/slave-8002.json
+```
 
-## ✅ Conclusion
-shaunStore showcases a robust architecture for distributed data storage. It successfully demonstrates core distributed systems concepts such as consensus, replication, and high-concurrency connection handling in a scalable environment.
+---
+
+# Testing
+
+## Ping
+
+```bash
+./scripts/resp_client.sh 127.0.0.1 8000 PING
+```
+
+Expected:
+
+```text
++PONG
+```
+
+## Set a Value
+
+```bash
+./scripts/resp_client.sh 127.0.0.1 8000 SET name YourName
+```
+
+## Retrieve a Value
+
+```bash
+./scripts/resp_client.sh 127.0.0.1 8000 GET name
+```
+
+---
+
+# Failure Recovery Demo
+
+1. Start the cluster.
+2. Terminate the master process.
+3. Wait for the election timeout.
+4. Observe a slave becoming the new leader.
+
+This demonstrates:
+
+* Heartbeat monitoring
+* Failure detection
+* Leader election
+* Automatic recovery
