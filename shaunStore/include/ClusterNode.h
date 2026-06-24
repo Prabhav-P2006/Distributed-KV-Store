@@ -99,6 +99,8 @@ private:
     std::string processWriteCommand(const std::vector<std::string> &tokens);
     void applyReplicatedWrite(const ReplicationEntry &entry);
     void appendToBacklog(const ReplicationEntry &entry);
+    void updateBacklogDispatchOffset(std::uint64_t write_offset, std::uint64_t dispatch_offset);
+    void updateDispatchProgress(std::uint64_t dispatch_offset);
     void recordApplyOrder(const ReplicationEntry &entry);
 
     void connectToMasterIfNeeded();
@@ -106,7 +108,7 @@ private:
     void becomeMaster();
     void becomeFollower(const Endpoint &master_endpoint, std::uint64_t term);
     void startElectionRound();
-    bool sendVoteRequest(const Endpoint &peer, std::uint64_t term, std::uint64_t offset);
+    bool sendVoteRequest(const Endpoint &peer, std::uint64_t term, std::uint64_t dispatch_progress);
     void broadcastNewMaster();
     void sendHeartbeatToSlaves();
     void sendBacklogToReplica(const std::shared_ptr<SlaveSession> &session, std::uint64_t from_offset);
@@ -129,7 +131,9 @@ private:
     std::atomic<int> listener_fd_{-1};
     std::atomic<int> master_fd_{-1};
     std::atomic<std::uint64_t> replication_offset_{0};
-    std::atomic<std::uint64_t> known_master_offset_{0};
+    std::atomic<std::uint64_t> next_dispatch_offset_{0};
+    std::atomic<std::uint64_t> dispatch_progress_{0};
+    std::atomic<std::uint64_t> known_master_dispatch_progress_{0};
     std::atomic<std::uint64_t> last_sync_request_offset_{0};
     std::atomic<std::uint64_t> current_term_{0};
     std::atomic<NodeRole> role_{NodeRole::Slave};
@@ -147,6 +151,9 @@ private:
 
     mutable std::mutex backlog_mutex_;
     std::deque<ReplicationEntry> backlog_;
+
+    mutable std::mutex pending_dispatch_mutex_;
+    std::unordered_set<std::uint64_t> pending_dispatch_offsets_;
 
     mutable std::mutex ack_mutex_;
     std::unordered_map<std::uint64_t, std::shared_ptr<AckTracker>> ack_trackers_;

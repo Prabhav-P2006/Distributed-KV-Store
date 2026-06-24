@@ -36,6 +36,7 @@ struct ClientCommand
 struct ReplicationEntry
 {
     std::uint64_t offset{0};
+    std::uint64_t dispatch_offset{0};
     std::vector<std::string> tokens;
     ReplicationPriority priority{ReplicationPriority::Standard};
     ConsistencyMode consistency{ConsistencyMode::Eventual};

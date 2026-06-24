@@ -353,16 +353,45 @@ void ClusterNode::appendToBacklog(const ReplicationEntry &entry)
     }
 }
 
+void ClusterNode::updateBacklogDispatchOffset(const std::uint64_t write_offset, const std::uint64_t dispatch_offset)
+{
+    std::scoped_lock lock(backlog_mutex_);
+    for (auto &entry : backlog_)
+    {
+        if (entry.offset == write_offset)
+        {
+            entry.dispatch_offset = dispatch_offset;
+            return;
+        }
+    }
+}
+
+void ClusterNode::updateDispatchProgress(const std::uint64_t dispatch_offset)
+{
+    if (dispatch_offset == 0)
+    {
+        return;
+    }
+
+    std::scoped_lock lock(pending_dispatch_mutex_);
+    pending_dispatch_offsets_.insert(dispatch_offset);
+
+    while (pending_dispatch_offsets_.erase(dispatch_progress_.load() + 1) > 0)
+    {
+        dispatch_progress_.fetch_add(1);
+    }
+}
+
 bool ClusterNode::isStaleRead() const
 {
     if (role() == NodeRole::Master)
     {
         return false;
     }
-    const auto master_offset = known_master_offset_.load();
-    const auto local_offset = replication_offset_.load();
-    return master_offset > local_offset &&
-           (master_offset - local_offset) > config_.max_staleness_offset;
+    const auto master_progress = known_master_dispatch_progress_.load();
+    const auto local_progress = dispatch_progress_.load();
+    return master_progress > local_progress &&
+           (master_progress - local_progress) > config_.max_staleness_offset;
 }
 
 std::size_t ClusterNode::liveReplicaCount() const
@@ -389,6 +418,7 @@ void ClusterNode::applyReplicatedWrite(const ReplicationEntry &entry)
     }
 
     replication_offset_ = std::max(replication_offset_.load(), entry.offset);
+    updateDispatchProgress(entry.dispatch_offset);
     recordApplyOrder(entry);
 }
 
@@ -464,7 +494,7 @@ bool ClusterNode::handlePeerControl(Connection &connection, const std::vector<st
 
         const auto term = static_cast<std::uint64_t>(std::stoull(tokens[1]));
         const Endpoint candidate{tokens[2], static_cast<std::uint16_t>(std::stoi(tokens[3]))};
-        const auto candidate_offset = static_cast<std::uint64_t>(std::stoull(tokens[4]));
+        const auto candidate_progress = static_cast<std::uint64_t>(std::stoull(tokens[4]));
 
         bool granted = false;
         {
@@ -475,11 +505,11 @@ bool ClusterNode::handlePeerControl(Connection &connection, const std::vector<st
                 vote_state_.voted_for = {};
             }
 
-            const auto local_offset = replication_offset_.load();
-            const bool up_to_date = candidate_offset >= local_offset;
+            const auto local_progress = dispatch_progress_.load();
+            const bool up_to_date = candidate_progress >= local_progress;
             const bool preferred_candidate = !vote_state_.voted_for.valid() ||
-                                             candidate_offset > local_offset ||
-                                             (candidate_offset == local_offset && candidate < vote_state_.voted_for);
+                                             candidate_progress > local_progress ||
+                                             (candidate_progress == local_progress && candidate < vote_state_.voted_for);
 
             if (term >= vote_state_.term && up_to_date && preferred_candidate)
             {
@@ -831,7 +861,8 @@ void ClusterNode::connectToMasterIfNeeded()
     }
     else
     {
-        log("Connected to master at " + leader.toString() + " with offset " + std::to_string(last_sync_request_offset_.load()));
+        log("Connected to master at " + leader.toString() +
+            " with write_offset " + std::to_string(last_sync_request_offset_.load()));
     }
 }
 
@@ -885,18 +916,23 @@ void ClusterNode::masterConnectionLoop()
             }
 
             const auto type = toLower(tokens[0]);
-            if (type == "repl_write" && tokens.size() >= 5)
+            if (type == "repl_write" && tokens.size() >= 6)
             {
                 ReplicationEntry entry;
                 entry.offset = static_cast<std::uint64_t>(std::stoull(tokens[1]));
-                entry.priority = parsePriority(tokens[2]).value_or(ReplicationPriority::Standard);
-                entry.consistency = parseConsistency(tokens[3]).value_or(ConsistencyMode::Eventual);
-                entry.tokens.assign(tokens.begin() + 4, tokens.end());
+                entry.dispatch_offset = static_cast<std::uint64_t>(std::stoull(tokens[2]));
+                entry.priority = parsePriority(tokens[3]).value_or(ReplicationPriority::Standard);
+                entry.consistency = parseConsistency(tokens[4]).value_or(ConsistencyMode::Eventual);
+                entry.tokens.assign(tokens.begin() + 5, tokens.end());
                 applyReplicatedWrite(entry);
-                known_master_offset_ = std::max(known_master_offset_.load(), entry.offset);
+                known_master_dispatch_progress_ =
+                    std::max(known_master_dispatch_progress_.load(), entry.dispatch_offset);
                 const auto ack = encodeArray({"ACK", std::to_string(entry.offset), std::to_string(endpoint().port)});
                 sendAll(fd, ack);
-                log("Applied replicated write offset " + std::to_string(entry.offset));
+                log("Applied replicated write write_offset=" + std::to_string(entry.offset) +
+                    " dispatch_offset=" + std::to_string(entry.dispatch_offset));
+                log("Sent ACK write_offset=" + std::to_string(entry.offset) +
+                    " dispatch_offset=" + std::to_string(entry.dispatch_offset));
                 continue;
             }
 
@@ -907,8 +943,9 @@ void ClusterNode::masterConnectionLoop()
                     last_heartbeat_at_ = std::chrono::steady_clock::now();
                 }
                 current_term_ = std::max(current_term_.load(), static_cast<std::uint64_t>(std::stoull(tokens[1])));
-                known_master_offset_ = static_cast<std::uint64_t>(std::stoull(tokens[4]));
-                log("Received heartbeat from " + tokens[2] + ":" + tokens[3] + " offset " + tokens[4]);
+                known_master_dispatch_progress_ = static_cast<std::uint64_t>(std::stoull(tokens[4]));
+                log("Received heartbeat from " + tokens[2] + ":" + tokens[3] +
+                    " dispatch_progress=" + tokens[4]);
                 continue;
             }
 
@@ -927,7 +964,7 @@ void ClusterNode::sendBacklogToReplica(const std::shared_ptr<SlaveSession> &sess
         std::scoped_lock lock(backlog_mutex_);
         for (const auto &entry : backlog_)
         {
-            if (entry.offset > from_offset)
+            if (entry.offset > from_offset && entry.dispatch_offset > 0)
             {
                 backlog_snapshot.push_back(entry);
             }
@@ -939,6 +976,7 @@ void ClusterNode::sendBacklogToReplica(const std::shared_ptr<SlaveSession> &sess
         auto payload = std::vector<std::string>{
             "REPL_WRITE",
             std::to_string(entry.offset),
+            std::to_string(entry.dispatch_offset),
             toString(entry.priority),
             toString(entry.consistency)};
         payload.insert(payload.end(), entry.tokens.begin(), entry.tokens.end());
@@ -965,6 +1003,10 @@ void ClusterNode::dispatcherLoop()
             continue;
         }
 
+        entry->dispatch_offset = next_dispatch_offset_.fetch_add(1) + 1;
+        updateBacklogDispatchOffset(entry->offset, entry->dispatch_offset);
+        dispatch_progress_ = entry->dispatch_offset;
+
         std::vector<std::shared_ptr<SlaveSession>> sessions;
         {
             std::scoped_lock lock(replica_mutex_);
@@ -977,10 +1019,14 @@ void ClusterNode::dispatcherLoop()
         auto payload = std::vector<std::string>{
             "REPL_WRITE",
             std::to_string(entry->offset),
+            std::to_string(entry->dispatch_offset),
             toString(entry->priority),
             toString(entry->consistency)};
         payload.insert(payload.end(), entry->tokens.begin(), entry->tokens.end());
         const auto frame = encodeArray(payload);
+
+        log("Dispatching replicated write write_offset=" + std::to_string(entry->offset) +
+            " dispatch_offset=" + std::to_string(entry->dispatch_offset));
 
         for (const auto &session : sessions)
         {
@@ -1000,7 +1046,7 @@ void ClusterNode::sendHeartbeatToSlaves()
                                     std::to_string(current_term_.load()),
                                     endpoint().host,
                                     std::to_string(endpoint().port),
-                                    std::to_string(replication_offset_.load())});
+                                    std::to_string(dispatch_progress_.load())});
 
     std::vector<std::shared_ptr<SlaveSession>> sessions;
     {
@@ -1042,6 +1088,8 @@ void ClusterNode::heartbeatLoop()
 void ClusterNode::becomeMaster()
 {
     role_ = NodeRole::Master;
+    next_dispatch_offset_ = std::max(next_dispatch_offset_.load(), dispatch_progress_.load());
+    known_master_dispatch_progress_ = dispatch_progress_.load();
     {
         std::scoped_lock lock(config_mutex_);
         current_master_ = endpoint();
@@ -1068,7 +1116,7 @@ void ClusterNode::becomeFollower(const Endpoint &master_endpoint, const std::uin
     log("Following new master " + master_endpoint.toString() + " for term " + std::to_string(term));
 }
 
-bool ClusterNode::sendVoteRequest(const Endpoint &peer, const std::uint64_t term, const std::uint64_t offset)
+bool ClusterNode::sendVoteRequest(const Endpoint &peer, const std::uint64_t term, const std::uint64_t dispatch_progress)
 {
     const int fd = createClientSocket(peer);
     if (fd < 0)
@@ -1080,7 +1128,7 @@ bool ClusterNode::sendVoteRequest(const Endpoint &peer, const std::uint64_t term
                                       std::to_string(term),
                                       endpoint().host,
                                       std::to_string(endpoint().port),
-                                      std::to_string(offset)});
+                                      std::to_string(dispatch_progress)});
 
     if (!sendAll(fd, request))
     {
@@ -1135,8 +1183,9 @@ void ClusterNode::startElectionRound()
 {
     role_ = NodeRole::Candidate;
     const auto term = current_term_.fetch_add(1) + 1;
-    const auto local_offset = replication_offset_.load();
-    log("Starting election term " + std::to_string(term) + " with offset " + std::to_string(local_offset));
+    const auto local_progress = dispatch_progress_.load();
+    log("Starting election term " + std::to_string(term) +
+        " with dispatch_progress=" + std::to_string(local_progress));
 
     {
         std::scoped_lock lock(config_mutex_);
@@ -1148,7 +1197,7 @@ void ClusterNode::startElectionRound()
     const auto peers_snapshot = peers();
     for (const auto &peer : peers_snapshot)
     {
-        if (sendVoteRequest(peer, term, local_offset))
+        if (sendVoteRequest(peer, term, local_progress))
         {
             ++votes;
         }
